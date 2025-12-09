@@ -3,7 +3,7 @@
 임펄스 감지 및 고정밀 동기화 알고리즘
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.2"
 
 import os
 import json
@@ -16,6 +16,87 @@ from pathlib import Path
 import config
 import tempfile
 from aup3_converter import extract_wav_from_aup3, extract_all_tracks_from_aup3
+
+
+def parse_sync_file(sync_file_path):
+    """
+    .sync 파일에서 박수 위치를 읽습니다.
+    형식: 00.000 (초 단위, 예: 04.526)
+
+    Args:
+        sync_file_path: .sync 파일 경로
+
+    Returns:
+        float: 박수 위치 (초), 오류 시 None
+    """
+    try:
+        with open(sync_file_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        # 특수 문자 마침표(․ U+2024)를 일반 마침표로 변환
+        content = content.replace('․', '.')
+        content = content.replace('\u2024', '.')
+        # 00.000 형식 파싱
+        time_sec = float(content)
+        return time_sec
+    except Exception as e:
+        # 에러 메시지를 ASCII로 출력 (한글 인코딩 문제 방지)
+        print(f"[ERROR] Failed to parse .sync file: {sync_file_path}")
+        print(f"Content: {repr(content if 'content' in locals() else 'N/A')}")
+        return None
+
+
+def find_best_impulse_in_range(audio, sr, hint_time, search_range=0.5, top_n=5):
+    """
+    힌트 시간 주변 ±search_range 초 범위에서 가장 강한 임펄스를 찾습니다.
+
+    Args:
+        audio: 오디오 데이터
+        sr: 샘플링 레이트
+        hint_time: 힌트 시간 (초)
+        search_range: 검색 범위 (±초)
+        top_n: 상위 후보 개수
+
+    Returns:
+        list: [(샘플 인덱스, 에너지), ...]
+    """
+    # 검색 범위 계산
+    start_time = max(0, hint_time - search_range)
+    end_time = hint_time + search_range
+
+    start_sample = int(start_time * sr)
+    end_sample = min(int(end_time * sr), len(audio))
+
+    # 검색 구간 추출
+    search_audio = audio[start_sample:end_sample]
+
+    # 임펄스 감지
+    window_size = int(0.01 * sr)  # 10ms
+    hop_size = window_size // 2
+
+    energy = np.array([
+        np.sum(search_audio[i:i+window_size]**2)
+        for i in range(0, len(search_audio) - window_size, hop_size)
+    ])
+
+    # 상위 N개 에너지 피크 찾기
+    peak_indices = []
+    for _ in range(top_n):
+        if len(energy) == 0:
+            break
+        max_idx = np.argmax(energy)
+        max_energy = energy[max_idx]
+
+        # 절대 샘플 인덱스로 변환
+        sample_idx = start_sample + max_idx * hop_size
+        peak_indices.append((sample_idx, max_energy))
+
+        # 주변 제거 (중복 방지)
+        exclude_range = int(0.1 * sr / hop_size)  # 100ms
+        start_exclude = max(0, max_idx - exclude_range)
+        end_exclude = min(len(energy), max_idx + exclude_range)
+        energy[start_exclude:end_exclude] = 0
+
+    return peak_indices
 
 
 def load_audio(file_path, duration=None, sr=None):
@@ -57,26 +138,35 @@ def load_audio(file_path, duration=None, sr=None):
                 pass
 
 
-def detect_impulse(audio, sr, threshold_factor=3.0):
+def detect_impulse(audio, sr, threshold_factor=3.0, search_duration=None):
     """
     오디오에서 임펄스(박수 소리 등)를 감지합니다.
+    지정된 검색 구간 내에서 가장 큰 에너지를 가진 임펄스를 찾습니다.
 
     Args:
         audio: 오디오 데이터
         sr: 샘플링 레이트
         threshold_factor: 임계값 계수 (평균 에너지의 몇 배)
+        search_duration: 임펄스 검색 구간 (초), None이면 전체 오디오
 
     Returns:
         impulse_index: 임펄스가 감지된 샘플 인덱스
     """
+    # 검색 구간 제한
+    if search_duration is not None:
+        search_samples = int(search_duration * sr)
+        search_audio = audio[:min(search_samples, len(audio))]
+    else:
+        search_audio = audio
+
     # 짧은 윈도우로 에너지 계산 (10ms)
     window_size = int(0.01 * sr)
     hop_size = window_size // 2
 
     # 에너지 계산
     energy = np.array([
-        np.sum(audio[i:i+window_size]**2)
-        for i in range(0, len(audio) - window_size, hop_size)
+        np.sum(search_audio[i:i+window_size]**2)
+        for i in range(0, len(search_audio) - window_size, hop_size)
     ])
 
     # 평균 및 표준편차 계산
@@ -86,41 +176,307 @@ def detect_impulse(audio, sr, threshold_factor=3.0):
     # 임계값: 평균 + (표준편차 * threshold_factor)
     threshold = mean_energy + (std_energy * threshold_factor)
 
-    # 임계값을 초과하는 첫 번째 지점 찾기
+    # 임계값을 초과하는 모든 지점 찾기
     impulse_indices = np.where(energy > threshold)[0]
 
     if len(impulse_indices) > 0:
-        # 첫 번째 임펄스의 실제 샘플 인덱스로 변환
-        impulse_index = impulse_indices[0] * hop_size
+        # 임계값을 초과한 지점들 중에서 가장 큰 에너지를 가진 지점 선택
+        # (첫 번째가 아닌 최대 에너지 임펄스 찾기)
+        max_energy_idx = impulse_indices[np.argmax(energy[impulse_indices])]
+        impulse_index = max_energy_idx * hop_size
         return impulse_index
     else:
-        # 임펄스를 찾지 못한 경우 0 반환
-        return 0
+        # 임계값을 초과하는 임펄스가 없으면 검색 구간 내에서 최댓값 사용
+        max_energy_idx = np.argmax(energy)
+        impulse_index = max_energy_idx * hop_size
+        return impulse_index
 
 
-def calculate_time_offset_precise(reference_audio, target_audio, sr, upsample_factor=10):
+def detect_multiple_impulses(audio, sr, threshold_factor=3.0, search_duration=None, top_n=5):
+    """
+    오디오에서 상위 N개의 임펄스 후보를 감지합니다.
+    카페 환경의 다양한 노이즈를 고려하여 여러 후보를 반환합니다.
+
+    Args:
+        audio: 오디오 데이터
+        sr: 샘플링 레이트
+        threshold_factor: 임계값 계수 (평균 에너지의 몇 배)
+        search_duration: 임펄스 검색 구간 (초), None이면 전체 오디오
+        top_n: 반환할 상위 후보 개수
+
+    Returns:
+        impulse_candidates: [(샘플 인덱스, 에너지 값), ...] 리스트 (에너지 높은 순)
+    """
+    # 검색 구간 제한
+    if search_duration is not None:
+        search_samples = int(search_duration * sr)
+        search_audio = audio[:min(search_samples, len(audio))]
+    else:
+        search_audio = audio
+
+    # 짧은 윈도우로 에너지 계산 (10ms)
+    window_size = int(0.01 * sr)
+    hop_size = window_size // 2
+
+    # 에너지 계산
+    energy = np.array([
+        np.sum(search_audio[i:i+window_size]**2)
+        for i in range(0, len(search_audio) - window_size, hop_size)
+    ])
+
+    # 평균 및 표준편차 계산
+    mean_energy = np.mean(energy)
+    std_energy = np.std(energy)
+
+    # 임계값: 평균 + (표준편차 * threshold_factor)
+    threshold = mean_energy + (std_energy * threshold_factor)
+
+    # 임계값을 초과하는 모든 지점 찾기
+    impulse_indices = np.where(energy > threshold)[0]
+
+    if len(impulse_indices) == 0:
+        # fallback: 상위 N개 에너지 피크 사용
+        impulse_indices = np.arange(len(energy))
+
+    # 에너지 순으로 정렬하여 상위 N개 선택
+    sorted_indices = impulse_indices[np.argsort(energy[impulse_indices])[::-1]]
+    top_indices = sorted_indices[:min(top_n, len(sorted_indices))]
+
+    # 결과를 (샘플 인덱스, 에너지) 튜플 리스트로 반환
+    candidates = [
+        (idx * hop_size, energy[idx])
+        for idx in top_indices
+    ]
+
+    return candidates
+
+
+def find_best_impulse_pair(reference_audio, target_audio, sr,
+                           ref_candidates, target_candidates,
+                           window_duration=1.0):
+    """
+    임펄스 후보 쌍들 중에서 cross-correlation이 가장 높은 쌍을 찾습니다.
+    동시 녹음된 파일은 박수 소리 구간의 파형이 유사하므로 높은 correlation을 보입니다.
+
+    Args:
+        reference_audio: 기준 오디오
+        target_audio: 대상 오디오
+        sr: 샘플링 레이트
+        ref_candidates: 기준 오디오의 임펄스 후보 리스트 [(인덱스, 에너지), ...]
+        target_candidates: 대상 오디오의 임펄스 후보 리스트 [(인덱스, 에너지), ...]
+        window_duration: 비교할 구간 길이 (초)
+
+    Returns:
+        best_ref_impulse: 최적의 기준 임펄스 샘플 인덱스
+        best_target_impulse: 최적의 대상 임펄스 샘플 인덱스
+        best_correlation: 최고 correlation 값
+    """
+    window_samples = int(window_duration * sr)
+    best_correlation = -np.inf
+    best_ref_impulse = ref_candidates[0][0]
+    best_target_impulse = target_candidates[0][0]
+
+    print(f"    - 임펄스 후보 쌍 비교 중: {len(ref_candidates)} x {len(target_candidates)} = {len(ref_candidates) * len(target_candidates)}개")
+
+    # 모든 후보 쌍의 correlation을 저장
+    pair_scores = []
+
+    for ref_idx, ref_energy in ref_candidates:
+        # 기준 오디오에서 임펄스 주변 구간 추출
+        ref_start = max(0, ref_idx - window_samples // 4)
+        ref_end = min(len(reference_audio), ref_idx + window_samples)
+        ref_segment = reference_audio[ref_start:ref_end]
+
+        for target_idx, target_energy in target_candidates:
+            # 대상 오디오에서 임펄스 주변 구간 추출
+            target_start = max(0, target_idx - window_samples // 4)
+            target_end = min(len(target_audio), target_idx + window_samples)
+            target_segment = target_audio[target_start:target_end]
+
+            # 짧은 구간이면 스킵
+            if len(ref_segment) < sr * 0.1 or len(target_segment) < sr * 0.1:
+                continue
+
+            # Cross-correlation 계산 (정규화)
+            correlation = signal.correlate(ref_segment, target_segment, mode='valid')
+
+            # 정규화: 각 세그먼트의 에너지로 나눔
+            ref_norm = np.sqrt(np.sum(ref_segment**2))
+            target_norm = np.sqrt(np.sum(target_segment**2))
+
+            if ref_norm > 0 and target_norm > 0:
+                max_corr = np.max(correlation) / (ref_norm * target_norm)
+            else:
+                max_corr = 0
+
+            # 결과 저장
+            pair_scores.append((max_corr, ref_idx, target_idx))
+
+            # 최고 점수 갱신
+            if max_corr > best_correlation:
+                best_correlation = max_corr
+                best_ref_impulse = ref_idx
+                best_target_impulse = target_idx
+
+    # 상위 10개 결과 출력
+    pair_scores.sort(reverse=True)
+    print(f"    - [디버그] 상위 10개 correlation 쌍:")
+    for i, (corr, ref_idx, tgt_idx) in enumerate(pair_scores[:10], 1):
+        print(f"      {i}위: 기준 {ref_idx/sr:.2f}초 - 대상 {tgt_idx/sr:.2f}초 (correlation: {corr:.4f})")
+
+    print(f"    - 최적 쌍: 기준 {best_ref_impulse/sr:.3f}초, 대상 {best_target_impulse/sr:.3f}초")
+    print(f"    - Correlation 점수: {best_correlation:.4f}")
+
+    # 동기화 신뢰도 검증
+    warning_message = None
+
+    # 1위-2위 차이 계산 (Gap) - 정보성 출력만
+    if len(pair_scores) >= 2:
+        gap = pair_scores[0][0] - pair_scores[1][0]
+        print(f"    - 1위-2위 Gap: {gap:.4f}")
+
+        # Gap 검증 제거: 박수를 거의 동시에 눌렀을 경우 차이가 거의 없을 수 있음
+        # 사용자가 .sync 파일로 수동 확인하므로 Gap이 작아도 정상 처리
+
+    # Correlation 절대값 검증 (사용자가 파형으로 직접 확인하므로 경고만 제거, 로그에 남기지 않음)
+    # if best_correlation < 0.5 and warning_message is None:
+    #     warning_message = f"낮은 correlation (corr={best_correlation:.4f} < 0.5)"
+    #     print(f"    - [경고] ★★★ {warning_message} ★★★")
+
+    return best_ref_impulse, best_target_impulse, best_correlation, warning_message
+
+
+def calculate_time_offset_precise(reference_audio, target_audio, sr, ref_hint_time=None, target_hint_time=None, upsample_factor=10):
     """
     두 오디오 간의 시간 오프셋을 정밀하게 계산합니다.
-    업샘플링을 통해 서브샘플 정확도를 달성합니다.
+    카페 환경의 다양한 노이즈를 고려하여 여러 임펄스 후보를 비교합니다.
+    동시 녹음된 파일은 박수 구간의 파형이 유사하므로 correlation으로 실제 박수를 식별합니다.
 
     Args:
         reference_audio: 기준 오디오 (JSON 포함 폴더)
         target_audio: 대상 오디오 (동기화할 오디오)
         sr: 샘플링 레이트
+        ref_hint_time: 기준 오디오의 힌트 시간 (초), None이면 전체 검색
+        target_hint_time: 대상 오디오의 힌트 시간 (초), None이면 전체 검색
         upsample_factor: 업샘플링 배율 (정확도 향상)
 
     Returns:
         offset_seconds: 오프셋 (초)
         offset_samples: 오프셋 (원본 샘플 단위)
+        sync_warning: 동기화 경고 메시지 (문제 없으면 None)
     """
-    print(f"    - 임펄스 감지 중...")
+    # 양쪽 모두 힌트가 있으면 target 힌트 위치를 기준으로 cross-correlation 사용
+    # (Audacity 프로젝트에서 각 트랙의 offset이 다를 수 있으므로, ref 힌트 위치를 그대로 신뢰하지 않음)
+    if ref_hint_time is not None and target_hint_time is not None:
+        print(f"    - [이중 수동 힌트] 대상 {target_hint_time:.3f}초 기준, 기준 오디오에서 cross-correlation으로 검색")
 
-    # 임펄스 감지
-    ref_impulse = detect_impulse(reference_audio, sr, threshold_factor=config.IMPULSE_THRESHOLD)
-    target_impulse = detect_impulse(target_audio, sr, threshold_factor=config.IMPULSE_THRESHOLD)
+        # target(음성_360)의 힌트 위치에서 임펄스 구간 추출
+        target_impulse = int(target_hint_time * sr)
+        window_samples = int(1.0 * sr)
 
-    print(f"    - 기준 임펄스 위치: {ref_impulse/sr:.3f}초")
-    print(f"    - 대상 임펄스 위치: {target_impulse/sr:.3f}초")
+        target_start = max(0, target_impulse - window_samples // 4)
+        target_end = min(len(target_audio), target_impulse + window_samples)
+        target_segment = target_audio[target_start:target_end]
+
+        if len(target_segment) < sr * 0.1:
+            print(f"    - [경고] 대상 오디오 구간이 너무 짧음, 자동 감지로 전환")
+            ref_hint_time = None
+            target_hint_time = None
+        else:
+            # reference(ch4) 전체에서 target_segment와 가장 유사한 위치 찾기
+            # 검색 범위: 처음 30초 (박수는 보통 녹음 시작 부분에 있음)
+            search_duration = 30.0
+            search_samples = int(search_duration * sr)
+            ref_search = reference_audio[:min(search_samples, len(reference_audio))]
+
+            # Cross-correlation
+            correlation = signal.correlate(ref_search, target_segment, mode='valid')
+            max_corr_idx = np.argmax(correlation)
+            max_corr_value = correlation[max_corr_idx]
+
+            # 정규화된 correlation 값 계산
+            target_energy = np.sqrt(np.sum(target_segment**2))
+            if target_energy > 0:
+                ref_window = ref_search[max_corr_idx:max_corr_idx + len(target_segment)]
+                ref_energy = np.sqrt(np.sum(ref_window**2))
+                if ref_energy > 0:
+                    normalized_corr = max_corr_value / (target_energy * ref_energy)
+                else:
+                    normalized_corr = 0
+            else:
+                normalized_corr = 0
+
+            # 실제 임펄스 위치 계산 (window_samples//4를 더해서 중앙 위치로 조정)
+            ref_impulse = max_corr_idx + window_samples // 4
+
+            print(f"    - [검색 결과] 기준 오디오에서 임펄스 발견: {ref_impulse/sr:.3f}초 (correlation: {normalized_corr:.4f})")
+            print(f"    - [비교] 대상 힌트: {target_hint_time:.3f}초, 기준 힌트(원본): {ref_hint_time:.3f}초, 기준 발견: {ref_impulse/sr:.3f}초")
+
+            sync_warning = None
+            if normalized_corr < 0.3:
+                sync_warning = f"낮은 correlation ({normalized_corr:.4f} < 0.3)"
+                print(f"    - [경고] ★★★ {sync_warning} - 수동 확인 권장 ★★★")
+
+            # 오프셋 계산 (기준에서 타겟을 빼면 타겟이 얼마나 앞서는지 계산됨)
+            offset_samples_analysis = ref_impulse - target_impulse
+            offset_seconds = offset_samples_analysis / sr
+
+            print(f"    - 오프셋 계산: {offset_seconds:.3f}초 ({offset_samples_analysis} 샘플 @ {sr}Hz)")
+
+            return offset_seconds, offset_samples_analysis, sync_warning
+    elif ref_hint_time is not None:
+        print(f"    - [수동 힌트] 기준 오디오 {ref_hint_time:.3f}초 ±0.5초 범위에서 검색...")
+        ref_candidates = find_best_impulse_in_range(reference_audio, sr, ref_hint_time, search_range=0.5, top_n=5)
+        target_candidates = detect_multiple_impulses(
+            target_audio,
+            sr,
+            threshold_factor=config.IMPULSE_THRESHOLD,
+            search_duration=config.IMPULSE_SEARCH_DURATION,
+            top_n=config.IMPULSE_CANDIDATES
+        )
+    elif target_hint_time is not None:
+        print(f"    - [수동 힌트] 대상 오디오 {target_hint_time:.3f}초 ±0.5초 범위에서 검색...")
+        ref_candidates = detect_multiple_impulses(
+            reference_audio,
+            sr,
+            threshold_factor=config.IMPULSE_THRESHOLD,
+            search_duration=config.IMPULSE_SEARCH_DURATION,
+            top_n=config.IMPULSE_CANDIDATES
+        )
+        target_candidates = find_best_impulse_in_range(target_audio, sr, target_hint_time, search_range=0.5, top_n=5)
+    else:
+        print(f"    - 임펄스 후보 감지 중 (검색 구간: {config.IMPULSE_SEARCH_DURATION}초)...")
+        # 상위 N개 임펄스 후보 감지 (카페 노이즈 환경 대응)
+        ref_candidates = detect_multiple_impulses(
+            reference_audio,
+            sr,
+            threshold_factor=config.IMPULSE_THRESHOLD,
+            search_duration=config.IMPULSE_SEARCH_DURATION,
+            top_n=config.IMPULSE_CANDIDATES
+        )
+        target_candidates = detect_multiple_impulses(
+            target_audio,
+            sr,
+            threshold_factor=config.IMPULSE_THRESHOLD,
+            search_duration=config.IMPULSE_SEARCH_DURATION,
+            top_n=config.IMPULSE_CANDIDATES
+        )
+
+    print(f"    - 기준 오디오 후보: {len(ref_candidates)}개 [{', '.join([f'{idx/sr:.2f}초' for idx, _ in ref_candidates[:3]])}...]")
+    print(f"    - 대상 오디오 후보: {len(target_candidates)}개 [{', '.join([f'{idx/sr:.2f}초' for idx, _ in target_candidates[:3]])}...]")
+
+    # 최적의 임펄스 쌍 찾기 (correlation 기반)
+    ref_impulse, target_impulse, correlation_score, sync_warning = find_best_impulse_pair(
+        reference_audio, target_audio, sr,
+        ref_candidates, target_candidates,
+        window_duration=1.0
+    )
+
+    # 동기화 신뢰도 확인 (사용자가 파형으로 직접 확인하므로 correlation 경고는 로그에 남기지 않음)
+    # low_confidence = correlation_score < config.SYNC_CONFIDENCE_THRESHOLD
+    # if low_confidence and sync_warning is None:
+    #     sync_warning = f"낮은 correlation (corr={correlation_score:.4f} < {config.SYNC_CONFIDENCE_THRESHOLD})"
+    #     print(f"    - [경고] ★★★ 동기화 신뢰도 낮음!...")
 
     # 임펄스 감지 여부 확인
     impulse_detected = (ref_impulse > 0 or target_impulse > 0)
@@ -174,10 +530,14 @@ def calculate_time_offset_precise(reference_audio, target_audio, sr, upsample_fa
     # 초 단위로 변환
     offset_seconds = offset_samples_fine / sr
 
-    return offset_seconds, int(round(offset_samples_fine))
+    # 신뢰도 낮은 경우 최종 결과에도 경고 표시
+    if sync_warning:
+        print(f"  ★ 주의: {sync_warning} - 수동 확인 권장 ★")
+
+    return offset_seconds, int(round(offset_samples_fine)), sync_warning
 
 
-def calculate_time_offset(reference_audio, target_audio, sr):
+def calculate_time_offset(reference_audio, target_audio, sr, ref_hint_time=None, target_hint_time=None):
     """
     두 오디오 간의 시간 오프셋을 계산합니다.
     Cross-correlation을 사용하여 동기화 지점을 찾습니다.
@@ -186,13 +546,15 @@ def calculate_time_offset(reference_audio, target_audio, sr):
         reference_audio: 기준 오디오 (JSON 포함 폴더)
         target_audio: 대상 오디오 (동기화할 오디오)
         sr: 샘플링 레이트
+        ref_hint_time: 기준 오디오의 힌트 시간 (초), None이면 전체 검색
+        target_hint_time: 대상 오디오의 힌트 시간 (초), None이면 전체 검색
 
     Returns:
         offset_seconds: 오프셋 (초)
         positive이면 target이 늦게 시작, negative이면 target이 일찍 시작
     """
     # 정밀 모드 사용 (임펄스 기반 + 업샘플링)
-    return calculate_time_offset_precise(reference_audio, target_audio, sr, upsample_factor=10)
+    return calculate_time_offset_precise(reference_audio, target_audio, sr, ref_hint_time=ref_hint_time, target_hint_time=target_hint_time, upsample_factor=10)
 
 
 def sync_audio_pair(reference_path, target_path, output_path, offset_samples, analysis_sr):
@@ -492,51 +854,84 @@ def find_json_file(audio_file, audio_dir):
 
 def find_trim_range_by_reference(extracted_wav, reference_wav, downsample_factor=100):
     """
-    교차상관을 사용하여 추출된 WAV에서 reference WAV가 위치한 범위를 찾습니다.
-    (Audacity의 trimLeft/trimRight 자동 감지용)
-    
+    교차상관을 사용하여 추출된 WAV와 reference WAV 사이의 오프셋을 찾습니다.
+    Audacity에서 각 트랙의 시작 위치가 다를 수 있으므로, 이 오프셋을 감지합니다.
+
     Args:
-        extracted_wav: .aup3에서 추출한 전체 WAV 파일 경로
-        reference_wav: 음성 폴더의 trim된 WAV 파일 경로 (정답)
+        extracted_wav: .aup3에서 추출한 WAV 파일 경로
+        reference_wav: 음성 폴더의 WAV 파일 경로 (정확한 타임라인 기준)
         downsample_factor: 다운샘플링 비율 (빠른 검색용)
-    
+
     Returns:
         tuple: (trim_left_samples, trim_right_samples, original_sr)
+               trim_left > 0: 추출된 오디오 앞부분 제거 필요
+               trim_left < 0: 추출된 오디오 앞에 무음 추가 필요 (현재 0으로 반환)
                또는 실패시 (None, None, None)
     """
     try:
         # 파일 로드
         extracted_audio, sr1 = sf.read(extracted_wav)
         reference_audio, sr2 = sf.read(reference_wav)
-        
+
         if sr1 != sr2:
             print(f"  [경고] 샘플레이트가 다릅니다: extracted={sr1}Hz, reference={sr2}Hz")
             return None, None, None
-        
+
         sr = sr1
-        
+
         # 모노로 변환
         if len(extracted_audio.shape) > 1:
             extracted_audio = np.mean(extracted_audio, axis=1)
         if len(reference_audio.shape) > 1:
             reference_audio = np.mean(reference_audio, axis=1)
-        
+
+        # 처음 60초만 사용하여 오프셋 감지 (속도 향상)
+        max_duration = 60  # 초
+        max_samples = int(max_duration * sr)
+        ext_segment = extracted_audio[:min(max_samples, len(extracted_audio))]
+        ref_segment = reference_audio[:min(max_samples, len(reference_audio))]
+
         # 다운샘플링 (빠른 검색)
-        extracted_down = extracted_audio[::downsample_factor]
-        reference_down = reference_audio[::downsample_factor]
-        
-        # 교차상관
-        correlation = signal.correlate(extracted_down, reference_down, mode='valid')
+        extracted_down = ext_segment[::downsample_factor]
+        reference_down = ref_segment[::downsample_factor]
+
+        # 교차상관 (mode='full' 사용 - 두 신호 길이가 같아도 동작)
+        correlation = signal.correlate(extracted_down, reference_down, mode='full')
         max_idx = np.argmax(correlation)
-        
-        # 다운샘플 인덱스를 원본 인덱스로 변환
-        trim_left = max_idx * downsample_factor
-        trim_right = len(extracted_audio) - (trim_left + len(reference_audio))
-        
+
+        # 오프셋 계산: max_idx - (len(ref) - 1)이 0이면 정렬됨
+        # 양수: reference가 extracted보다 뒤에 있음 → extracted 앞부분 제거 필요
+        # 음수: reference가 extracted보다 앞에 있음 → extracted 앞에 무음 추가 필요
+        offset_down = max_idx - (len(reference_down) - 1)
+        offset_samples = offset_down * downsample_factor
+        offset_seconds = offset_samples / sr
+
+        print(f"    → 오프셋 감지: {offset_seconds:.3f}초 ({offset_samples} 샘플)")
+
+        if offset_samples > 0:
+            # 추출된 오디오 앞부분 제거 필요
+            trim_left = offset_samples
+            trim_right = len(extracted_audio) - (trim_left + len(reference_audio))
+            trim_right = max(0, trim_right)  # 음수 방지
+            print(f"    → 추출된 오디오 앞 {offset_seconds:.3f}초 제거 필요")
+        elif offset_samples < 0:
+            # 추출된 오디오 앞에 무음 추가 필요 (sync_audio_pair에서 처리됨)
+            # 여기서는 trim_left=0으로 반환하고, 오프셋 정보만 출력
+            trim_left = 0
+            trim_right = 0
+            print(f"    → 추출된 오디오가 {-offset_seconds:.3f}초 뒤에 시작 (sync에서 처리)")
+        else:
+            # 완벽히 정렬됨
+            trim_left = 0
+            trim_right = 0
+            print(f"    → 이미 정렬되어 있음")
+
         return trim_left, trim_right, sr
-        
+
     except Exception as e:
         print(f"  [오류] Trim 범위 찾기 실패: {e}")
+        import traceback
+        traceback.print_exc()
         return None, None, None
 
 

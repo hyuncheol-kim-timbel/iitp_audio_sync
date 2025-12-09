@@ -1,0 +1,38 @@
+오디오 동기화 프로그램 v1.0.2 사용법
+======================================
+
+1. 가상환경 생성 및 활성화
+  python -m venv myenv
+  myenv\Scripts\activate   (Windows)
+  source myenv/bin/activate (Linux)
+
+2. 라이브러리 설치
+  pip install -r requirements.txt
+
+3. 폴더 구조 준비
+  부모폴더/
+  ├── 음성/          ← JSON 자막 + 중앙마이크 WAV
+  ├── 프로젝트/      ← 7채널 .aup3 파일
+  └── 음성_360/      ← 360 카메라 WAV
+
+4. 배치 동기화 실행
+  python batch_process.py "C:\Projects\IITP\20251113_자료\test12"
+
+  * logs 폴더에서 로그 확인
+  * .aup3 파일 손상 시 음성/ 폴더의 WAV로 자동 대체 (Fallback)
+
+5. 검수
+  Audacity로 음성_output과 음성_360 폴더의 동기화 확인
+
+  실패 시 .sync 파일 쌍 생성 (박수 위치 timestamp 저장):
+    프로젝트/VID_20250811_180910_00_001.sync  내용: 07.042
+    음성_360/LRV_20250811_180910_11_001.sync  내용: 02.670
+
+6. .sync 파일이 있는 항목만 재처리
+  python batch_process.py "C:\Projects\IITP\20251113_자료\test12" --only-with-sync
+
+출력 결과
+---------
+  부모폴더/
+  ├── 프로젝트_output/  ← 7채널 동기화 WAV + JSON
+  └── 음성_output/      ← 중앙마이크(ch4) WAV + JSON

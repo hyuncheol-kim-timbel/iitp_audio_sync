@@ -6,7 +6,7 @@ Audacity 3.0 이상의 프로젝트 파일(.aup3)은 SQLite 데이터베이스�
 이 모듈은 .aup3 파일에서 오디오 데이터를 추출하여 WAV 파일로 변환합니다.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.2"
 
 import sqlite3
 import numpy as np
@@ -143,7 +143,14 @@ def extract_all_tracks_from_aup3(aup3_path, output_dir, base_filename=None):
         cursor = conn.cursor()
 
         # 트랙 정보 가져오기
-        info = get_aup3_info(aup3_path)
+        try:
+            info = get_aup3_info(aup3_path)
+        except sqlite3.DatabaseError as e:
+            print(f"  [오류] ★★★ 파일 손상됨 - 수동 처리 필요 ★★★")
+            print(f"  [오류] SQLite 오류: {e}")
+            print(f"  [해결방법] Audacity에서 열어서 다른 이름으로 저장하거나 WAV로 내보내기")
+            conn.close()
+            return []
         sample_rate = info['sample_rate']
         num_tracks = info['num_tracks']
 
@@ -207,14 +214,31 @@ def extract_all_tracks_from_aup3(aup3_path, output_dir, base_filename=None):
                 #   131073 (0x20001) = int16Sample
                 #   262144 (0x40000) = floatSample
                 #   196608 (0x30000) = int24Sample
-                if sampleformat == 131073 or sampleformat == 'int16Sample':
-                    # int16 형식 (2바이트)
-                    samples_array = np.frombuffer(samples, dtype='<i2').astype(np.float32) / 32768.0
-                elif sampleformat == 262144 or sampleformat == 'floatSample' or sampleformat is None:
-                    # float32 형식 (4바이트)
+                # 일부 파일은 플래그가 추가되므로 비트 마스크로 검사
+
+                # 문자열 형식 처리
+                if isinstance(sampleformat, str):
+                    if sampleformat == 'int16Sample':
+                        samples_array = np.frombuffer(samples, dtype='<i2').astype(np.float32) / 32768.0
+                    elif sampleformat == 'floatSample':
+                        samples_array = np.frombuffer(samples, dtype='<f4')
+                    elif sampleformat == 'int24Sample':
+                        print(f"  [경고] int24 형식은 현재 지원하지 않습니다. 블록 건너뜀")
+                        continue
+                    else:
+                        print(f"  [경고] 알 수 없는 문자열 형식 ({sampleformat}), int16으로 시도")
+                        try:
+                            samples_array = np.frombuffer(samples, dtype='<i2').astype(np.float32) / 32768.0
+                        except:
+                            continue
+                elif sampleformat is None or (isinstance(sampleformat, int) and sampleformat & 0x40000):
+                    # float32 형식: 0x40000 비트가 설정됨 (262144, 262159 등)
                     samples_array = np.frombuffer(samples, dtype='<f4')
-                elif sampleformat == 196608 or sampleformat == 'int24Sample':
-                    # int24 형식 (3바이트) - 복잡하므로 일단 건너뜀
+                elif isinstance(sampleformat, int) and sampleformat & 0x20000:
+                    # int16 형식: 0x20000 비트가 설정됨 (131073 등)
+                    samples_array = np.frombuffer(samples, dtype='<i2').astype(np.float32) / 32768.0
+                elif isinstance(sampleformat, int) and sampleformat & 0x30000:
+                    # int24 형식: 0x30000 비트가 설정됨 (196608 등)
                     print(f"  [경고] int24 형식은 현재 지원하지 않습니다. 블록 건너뜀")
                     continue
                 else:
@@ -317,14 +341,32 @@ def extract_wav_from_aup3(aup3_path, output_wav_path, track_index=0):
             #   131073 (0x20001) = int16Sample
             #   262144 (0x40000) = floatSample
             #   196608 (0x30000) = int24Sample
-            if sampleformat == 131073 or sampleformat == 'int16Sample':
-                # int16 형식 (2바이트)
-                samples_array = np.frombuffer(samples, dtype='<i2').astype(np.float32) / 32768.0
-            elif sampleformat == 262144 or sampleformat == 'floatSample' or sampleformat is None:
-                # float32 형식 (4바이트)
+            # 일부 파일은 플래그가 추가되므로 비트 마스크로 검사
+
+            # 문자열 형식 처리
+            if isinstance(sampleformat, str):
+                if sampleformat == 'int16Sample':
+                    samples_array = np.frombuffer(samples, dtype='<i2').astype(np.float32) / 32768.0
+                elif sampleformat == 'floatSample':
+                    samples_array = np.frombuffer(samples, dtype='<f4')
+                elif sampleformat == 'int24Sample':
+                    print(f"  [경고] 블록 {blockid}: int24 형식은 현재 지원하지 않습니다. 건너뜀")
+                    continue
+                else:
+                    print(f"  [경고] 블록 {blockid}: 알 수 없는 문자열 형식 ({sampleformat}), int16으로 시도")
+                    try:
+                        samples_array = np.frombuffer(samples, dtype='<i2').astype(np.float32) / 32768.0
+                    except:
+                        print(f"  [경고] 블록 {blockid} 변환 실패, 건너뜀")
+                        continue
+            elif sampleformat is None or (isinstance(sampleformat, int) and sampleformat & 0x40000):
+                # float32 형식: 0x40000 비트가 설정됨 (262144, 262159 등)
                 samples_array = np.frombuffer(samples, dtype='<f4')
-            elif sampleformat == 196608 or sampleformat == 'int24Sample':
-                # int24 형식 (3바이트) - 복잡하므로 일단 건너뜀
+            elif isinstance(sampleformat, int) and sampleformat & 0x20000:
+                # int16 형식: 0x20000 비트가 설정됨 (131073 등)
+                samples_array = np.frombuffer(samples, dtype='<i2').astype(np.float32) / 32768.0
+            elif isinstance(sampleformat, int) and sampleformat & 0x30000:
+                # int24 형식: 0x30000 비트가 설정됨 (196608 등)
                 print(f"  [경고] 블록 {blockid}: int24 형식은 현재 지원하지 않습니다. 건너뜀")
                 continue
             else:
